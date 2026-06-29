@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { XMLParser } from "fast-xml-parser";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -15,9 +16,20 @@ const APP_FILE = "全方位股市分析師設計.html";
 const MARKET_TIME_ZONE = "Asia/Taipei";
 const YAHOO_SEARCH = "https://query1.finance.yahoo.com/v1/finance/search";
 const YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart";
+const TWSE_COMPANY_DIRECTORY = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L";
+const TPEX_COMPANY_DIRECTORY = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O";
+const GOOGLE_NEWS_RSS = "https://news.google.com/rss/search";
+const GOOGLE_CUSTOM_SEARCH = "https://www.googleapis.com/customsearch/v1";
+const GOOGLE_CSE_API_KEY = String(process.env.GOOGLE_CSE_API_KEY || "").trim();
+const GOOGLE_CSE_ID = String(process.env.GOOGLE_CSE_ID || "").trim();
 const CACHE_SECONDS = Number(process.env.CACHE_SECONDS || 60);
 const DASHBOARD_CACHE_SECONDS = Number(process.env.DASHBOARD_CACHE_SECONDS || 90);
 const SEARCH_CACHE_SECONDS = Number(process.env.SEARCH_CACHE_SECONDS || 300);
+const googleRssParser = new XMLParser({
+  ignoreAttributes: false,
+  processEntities: true,
+  trimValues: true,
+});
 
 const MIME_TYPES = new Map([
   [".html", "text/html; charset=utf-8"],
@@ -216,6 +228,14 @@ export async function handleApiRequest(requestUrl) {
     if (!query) return jsonResult({ ok: true, query, results: [], news: [] });
     const data = await searchAssets(query);
     return jsonResult({ ok: true, ...data });
+  }
+
+  if (requestUrl.pathname === "/api/crawl") {
+    const query = String(requestUrl.searchParams.get("q") || "").trim();
+    if (!query) return jsonResult({ ok: true, query, provider: "", results: [] });
+    const count = clamp(Number(requestUrl.searchParams.get("count") || 24), 1, 40);
+    const data = await crawlGoogleStockWeb(query, count);
+    return jsonResult({ ok: true, query, ...data });
   }
 
   if (requestUrl.pathname === "/api/quote") {
@@ -784,17 +804,234 @@ function hotStockScore(item) {
 async function searchAssets(query) {
   const normalized = query.trim();
   const aliases = aliasMatches(normalized);
-  const yahoo = await searchYahoo(normalized, 14, 8);
-  const localResults = aliases.map((symbol) => resultFromDirectory(symbol));
+  const yahooQuery = yahooSearchQuery(normalized, aliases);
+  const [yahoo, google, taiwanResults] = await Promise.all([
+    yahooQuery
+      ? searchYahoo(yahooQuery, 14, 8).catch(() => ({ quotes: [], news: [] }))
+      : Promise.resolve({ quotes: [], news: [] }),
+    crawlGoogleStockWeb(normalized, 24).catch(() => ({ provider: "Google unavailable", results: [] })),
+    searchTaiwanCompanyDirectory(normalized, 18).catch(() => []),
+  ]);
+  const verifiedTaiwanCodes = new Set(taiwanResults.map((item) => item.symbol.split(".")[0]));
+  const localResults = aliases
+    .filter((symbol) => {
+      const match = symbol.match(/^(\d{4,6})\.(TW|TWO)$/);
+      return !match || !verifiedTaiwanCodes.has(match[1]) || taiwanResults.some((item) => item.symbol === symbol);
+    })
+    .map((symbol) => resultFromDirectory(symbol));
   const yahooResults = (yahoo.quotes || []).map(normalizeYahooSearchQuote).filter(Boolean);
-  const merged = dedupeBySymbol([...localResults, ...yahooResults]).slice(0, 18);
+  const merged = dedupeBySymbol([...taiwanResults, ...localResults, ...yahooResults]).slice(0, 18);
+  const news = dedupeNews([
+    ...(google.results || []),
+    ...normalizeYahooNews(yahoo.news || []),
+  ]).slice(0, 24);
 
   return {
     query,
     results: merged,
-    news: normalizeYahooNews(yahoo.news || []),
-    source: "Yahoo Finance search",
+    news,
+    source: "Yahoo Finance stock data + Google web/news",
+    webProvider: google.provider,
   };
+}
+
+function yahooSearchQuery(query, aliases) {
+  if (!/[\u3400-\u9fff]/u.test(query)) return query;
+  for (const symbol of aliases) {
+    const details = SYMBOL_DIRECTORY.get(symbol.toUpperCase());
+    if (details?.yahooQuery) return details.yahooQuery;
+    if (symbol) return symbol;
+  }
+  return "";
+}
+
+async function searchTaiwanCompanyDirectory(query, count = 18) {
+  const needle = normalizeCompanySearchText(query);
+  if (!needle) return [];
+
+  const companies = await cached("taiwan-company-directory:v1", 6 * 60 * 60, async () => {
+    const [listed, otc] = await Promise.all([
+      fetchCompanyDirectory(TWSE_COMPANY_DIRECTORY, "TW"),
+      fetchCompanyDirectory(TPEX_COMPANY_DIRECTORY, "TWO"),
+    ]);
+    return [...listed, ...otc];
+  });
+
+  return companies
+    .map((item) => ({ ...item, score: companyMatchScore(item, needle) }))
+    .filter((item) => item.score > 0)
+    .sort((a, b) => b.score - a.score || a.symbol.localeCompare(b.symbol))
+    .slice(0, count)
+    .map(({ score, ...item }) => item);
+}
+
+async function fetchCompanyDirectory(url, yahooSuffix) {
+  const response = await fetch(url, {
+    headers: { "accept": "application/json", "user-agent": "OmniStock-Analyst/1.0" },
+  });
+  if (!response.ok) throw new Error(`Taiwan company directory failed: ${response.status}`);
+  const rows = await response.json();
+
+  return asArray(rows).map((row) => {
+    const code = String(row["公司代號"] || row.SecuritiesCompanyCode || "").trim();
+    const shortName = String(row["公司簡稱"] || row.CompanyAbbreviation || "").trim();
+    const longName = String(row["公司名稱"] || row.CompanyName || shortName).trim();
+    return {
+      symbol: code ? `${code}.${yahooSuffix}` : "",
+      name: shortName || longName || code,
+      yahooName: longName || shortName || code,
+      exchange: yahooSuffix === "TW" ? "TWSE" : "TPEx",
+      quoteType: "EQUITY",
+      assetClass: "stock",
+      category: "股票",
+      market: "台股",
+      source: `${yahooSuffix === "TW" ? "TWSE" : "TPEx"} company directory; Yahoo Finance quote`,
+      searchText: normalizeCompanySearchText(`${code} ${shortName} ${longName}`),
+      code,
+      shortName,
+      longName,
+    };
+  }).filter((item) => item.code && item.name);
+}
+
+function normalizeCompanySearchText(value) {
+  return String(value || "").toLowerCase().replace(/[\s\-_.()（）]+/g, "");
+}
+
+function companyMatchScore(item, needle) {
+  const code = normalizeCompanySearchText(item.code);
+  const shortName = normalizeCompanySearchText(item.shortName);
+  const longName = normalizeCompanySearchText(item.longName);
+  if (needle === code) return 100;
+  if (needle === shortName) return 95;
+  if (needle === longName) return 90;
+  if (code.startsWith(needle)) return 80;
+  if (shortName.startsWith(needle)) return 75;
+  if (longName.startsWith(needle)) return 70;
+  if (item.searchText.includes(needle)) return 50;
+  return 0;
+}
+
+async function crawlGoogleStockWeb(query, count = 24) {
+  const normalized = String(query || "").trim();
+  const safeCount = clamp(Number(count), 1, 40);
+  if (!normalized) return { provider: "", results: [] };
+
+  return cached(`google-stock:${normalized}:${safeCount}`, SEARCH_CACHE_SECONDS, async () => {
+    const searchQuery = buildGoogleStockQuery(normalized);
+
+    if (GOOGLE_CSE_API_KEY && GOOGLE_CSE_ID) {
+      const results = await searchGoogleProgrammable(searchQuery, safeCount);
+      if (results.length) return { provider: "Google Programmable Search", results };
+    }
+
+    return {
+      provider: "Google News RSS",
+      results: await searchGoogleNewsRss(searchQuery, safeCount),
+    };
+  });
+}
+
+function buildGoogleStockQuery(query) {
+  const symbol = aliasMatches(query)[0] || normalizePotentialSymbol(query);
+  const details = symbol ? SYMBOL_DIRECTORY.get(symbol.toUpperCase()) : null;
+  return [...new Set([
+    query,
+    symbol,
+    details?.zhName,
+    details?.yahooQuery,
+    "股票 stock",
+  ].filter(Boolean))].join(" ");
+}
+
+async function searchGoogleProgrammable(query, count) {
+  const pageCount = Math.min(4, Math.ceil(count / 10));
+  const pages = await Promise.all(Array.from({ length: pageCount }, async (_, index) => {
+    const url = new URL(GOOGLE_CUSTOM_SEARCH);
+    url.searchParams.set("key", GOOGLE_CSE_API_KEY);
+    url.searchParams.set("cx", GOOGLE_CSE_ID);
+    url.searchParams.set("q", query);
+    url.searchParams.set("num", String(Math.min(10, count - index * 10)));
+    url.searchParams.set("start", String(index * 10 + 1));
+    const response = await fetch(url, { headers: { "user-agent": "OmniStock-Analyst/1.0" } });
+    if (!response.ok) throw new Error(`Google Programmable Search failed: ${response.status}`);
+    const data = await response.json();
+    return (data.items || []).map((item) => ({
+      title: item.title || "",
+      publisher: item.displayLink || "Google",
+      link: item.link || "",
+      publishedAt: null,
+      snippet: item.snippet || "",
+      source: "Google Programmable Search",
+    }));
+  }));
+  return dedupeNews(pages.flat()).slice(0, count);
+}
+
+async function searchGoogleNewsRss(query, count) {
+  const url = new URL(GOOGLE_NEWS_RSS);
+  url.searchParams.set("q", query);
+  url.searchParams.set("hl", "zh-TW");
+  url.searchParams.set("gl", "TW");
+  url.searchParams.set("ceid", "TW:zh-Hant");
+
+  const response = await fetch(url, {
+    headers: {
+      "accept": "application/rss+xml, application/xml, text/xml",
+      "user-agent": "Mozilla/5.0 OmniStock-Analyst/1.0",
+    },
+  });
+  if (!response.ok) throw new Error(`Google News RSS failed: ${response.status}`);
+
+  const xml = await response.text();
+  const parsed = googleRssParser.parse(xml);
+  const items = asArray(parsed?.rss?.channel?.item);
+  return dedupeNews(items.map((item) => ({
+    title: textValue(item.title),
+    publisher: textValue(item.source) || "Google News",
+    link: textValue(item.link),
+    publishedAt: normalizeDate(item.pubDate),
+    snippet: stripHtml(textValue(item.description)),
+    source: "Google News RSS",
+  })).filter((item) => item.title && item.link)).slice(0, count);
+}
+
+function asArray(value) {
+  if (!value) return [];
+  return Array.isArray(value) ? value : [value];
+}
+
+function textValue(value) {
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (value && typeof value === "object") return String(value["#text"] || "");
+  return "";
+}
+
+function normalizeDate(value) {
+  const date = new Date(String(value || ""));
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function stripHtml(value) {
+  return String(value || "")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&quot;/gi, '"')
+    .replace(/&#39;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 320);
+}
+
+function dedupeNews(items) {
+  const seen = new Set();
+  return items.filter((item) => {
+    const key = String(item.link || item.title || "").trim().toLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
 async function searchYahoo(query, quotesCount = 10, newsCount = 4) {

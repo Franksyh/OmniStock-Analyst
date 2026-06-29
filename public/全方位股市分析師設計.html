@@ -1104,7 +1104,7 @@
       <div class="search-shell">
         <i data-lucide="search" class="search-icon"></i>
         <div class="search-row">
-          <input id="searchInput" autocomplete="off" placeholder="輸入代號或名稱：2330、NVDA、0050、TLT、美元台幣">
+          <input id="searchInput" autocomplete="off" aria-label="輸入股票代號或名稱" placeholder="輸入股票代號或名稱：2330、台積電、NVDA、NVIDIA">
           <button id="searchButton" class="btn primary" type="button"><i data-lucide="search"></i><span>搜尋</span></button>
         </div>
         <div id="searchResults" class="search-results hide"></div>
@@ -1186,13 +1186,13 @@
               <div class="section-head">
                 <div class="section-title">
                   <i data-lucide="radar"></i>
-                  <h2>焦點候選</h2>
+                  <h2>推薦飆股</h2>
                 </div>
                 <div class="segmented" id="hotFilter">
                   <button class="active" data-price-range="all" type="button">全部</button>
-                  <button data-price-range="lt100" type="button">100 元內</button>
-                  <button data-price-range="100to200" type="button">100-200 元</button>
-                  <button data-price-range="gt200" type="button">200 元以上</button>
+                  <button data-price-range="lte100" type="button">100 元內</button>
+                  <button data-price-range="100to300" type="button">100-300 元</button>
+                  <button data-price-range="gte300" type="button">300 元以上</button>
                 </div>
               </div>
               <div id="hotList" class="hot-list"></div>
@@ -1231,7 +1231,7 @@
           <div class="table-tools">
             <div class="section-title">
               <i data-lucide="candlestick-chart"></i>
-              <h2>股票分析</h2>
+              <h2>股票推薦（飆股）</h2>
             </div>
             <div class="segmented" id="stockMarketFilter">
               <button class="active" data-market="tw" type="button">台股</button>
@@ -1240,9 +1240,9 @@
             </div>
             <div class="segmented" id="stockPriceFilter">
               <button class="active" data-price-range="all" type="button">全部價格</button>
-              <button data-price-range="lt100" type="button">100 元內</button>
-              <button data-price-range="100to200" type="button">100-200 元</button>
-              <button data-price-range="gt200" type="button">200 元以上</button>
+              <button data-price-range="lte100" type="button">100 元內</button>
+              <button data-price-range="100to300" type="button">100-300 元</button>
+              <button data-price-range="gte300" type="button">300 元以上</button>
             </div>
           </div>
         </div>
@@ -1521,7 +1521,7 @@
         if (event.key === "Escape") closeSearchResults();
       });
       els.searchInput.addEventListener("input", debounce(() => {
-        if (els.searchInput.value.trim().length >= 2) runSearch();
+        if (els.searchInput.value.trim().length >= 1) runSearch();
         else closeSearchResults();
       }, 360));
 
@@ -1606,7 +1606,7 @@
     function renderDashboard() {
       const data = state.dashboard;
       if (!data) return;
-      els.sourceLabel.textContent = "即時市場資料";
+      els.sourceLabel.textContent = "Yahoo Finance 即時股價";
       els.refreshedAt.textContent = `更新：${formatDateTime(data.refreshedAt)}`;
       els.macroSummary.textContent = data.macro?.summary || "";
       els.overallBadge.textContent = data.macro?.overall || "--";
@@ -1850,13 +1850,13 @@
         </button>
       `).join("");
 
-      const newsHtml = news.slice(0, 3).map((item) => `
+      const newsHtml = news.slice(0, 8).map((item) => `
         <a class="search-result" href="${escapeAttr(item.link)}" target="_blank" rel="noreferrer">
           <span>
             <strong>${escapeHtml(item.title)}</strong><br>
-            <span class="symbol">${escapeHtml(item.publisher || "Yahoo Finance")} · ${item.publishedAt ? formatDateTime(item.publishedAt) : ""}</span>
+            <span class="symbol">${escapeHtml(item.publisher || item.source || "市場資訊")} · ${item.publishedAt ? formatDateTime(item.publishedAt) : ""}</span>
           </span>
-          <span class="badge">新聞</span>
+          <span class="badge">${String(item.source || "").includes("Google") ? "Google" : "新聞"}</span>
         </a>
       `).join("");
 
@@ -2193,9 +2193,9 @@
       if (range === "all") return true;
       const price = Number(item.price);
       if (!Number.isFinite(price)) return false;
-      if (range === "lt100") return price < 100;
-      if (range === "100to200") return price >= 100 && price <= 200;
-      if (range === "gt200") return price > 200;
+      if (range === "lte100") return price <= 100;
+      if (range === "100to300") return price > 100 && price < 300;
+      if (range === "gte300") return price >= 300;
       return true;
     }
 
